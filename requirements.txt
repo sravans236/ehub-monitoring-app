@@ -1,0 +1,8 @@
+azure-functions
+azure-eventhub>=5.11.0
+azure-identity
+azure-mgmt-eventhub
+azure-storage-blob
+applicationinsights
+opencensus-ext-azure
+python-dateutil
