@@ -14,6 +14,7 @@ from utils.logging_config import configure_logging
 from utils.eventhub_reader import LatestMessageReader
 from utils. logger import LatestMessageLogger
 from utils.eventhub_discovery import discover_eventhubs
+import json
 
 
 def main(timer: func.TimerRequest) -> None:
@@ -89,13 +90,8 @@ def main(timer: func.TimerRequest) -> None:
                     logger.error(f"    ❌ Could not get properties for partition {partition_id}")
                     continue
                 
-                # Print partition properties
-                logger.info(f"    📋 Properties:")
-                logger.info(f"       • IsEmpty: {props.get('isEmpty', True)}")
-                logger.info(f"       • BeginSeqNum: {props.get('beginningSequenceNumber', 'N/A')}")
-                logger.info(f"       • LastSeqNum: {props.get('lastEnqueuedSequenceNumber', 'N/A')}")
-                logger.info(f"       • LastOffset: {props.get('lastEnqueuedOffset', 'N/A')}")
-                logger.info(f"       • LastTime: {props.get('lastEnqueuedTimeUtc', 'N/A')}")
+                # Print partition properties as formatted JSON
+                logger.info(f"    📋 Properties: {json.dumps(props, indent=2, default=str)}")
                 
                 # ============================================
                 # 5. GET LATEST MESSAGE FROM LATEST SEQUENCE NUMBER
@@ -105,7 +101,7 @@ def main(timer: func.TimerRequest) -> None:
                 else:
                     logger.info(f"    🎯 Getting latest message from sequence {props.get('lastEnqueuedSequenceNumber', 'N/A')}...")
                     
-                    # Use sequence number to get latest message (message details are printed directly)
+                    # Try the improved sequence-based approach first
                     success = reader.get_latest_message_by_sequence(partition_id, props)
                     
                     if not success:
