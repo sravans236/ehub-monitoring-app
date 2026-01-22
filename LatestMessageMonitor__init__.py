@@ -91,19 +91,19 @@ def main(timer: func.TimerRequest) -> None:
                 
                 # Print partition properties
                 logger.info(f"    📋 Properties:")
-                logger.info(f"       • IsEmpty: {props['isEmpty']}")
-                logger.info(f"       • BeginSeqNum: {props['beginningSequenceNumber']}")
-                logger.info(f"       • LastSeqNum: {props['lastEnqueuedSequenceNumber']}")
-                logger.info(f"       • LastOffset: {props['lastEnqueuedOffset']}")
-                logger.info(f"       • LastTime: {props['lastEnqueuedTimeUtc']}")
+                logger.info(f"       • IsEmpty: {props.get('isEmpty', True)}")
+                logger.info(f"       • BeginSeqNum: {props.get('beginningSequenceNumber', 'N/A')}")
+                logger.info(f"       • LastSeqNum: {props.get('lastEnqueuedSequenceNumber', 'N/A')}")
+                logger.info(f"       • LastOffset: {props.get('lastEnqueuedOffset', 'N/A')}")
+                logger.info(f"       • LastTime: {props.get('lastEnqueuedTimeUtc', 'N/A')}")
                 
                 # ============================================
                 # 5. GET LATEST MESSAGE FROM LATEST SEQUENCE NUMBER
                 # ============================================
-                if props['isEmpty']:
+                if props.get('isEmpty', True):
                     logger.info(f"    📭 No messages in partition")
                 else:
-                    logger.info(f"    🎯 Getting latest message from sequence {props['lastEnqueuedSequenceNumber']}...")
+                    logger.info(f"    🎯 Getting latest message from sequence {props.get('lastEnqueuedSequenceNumber', 'N/A')}...")
                     
                     # Use sequence number to get latest message (message details are printed directly)
                     success = reader.get_latest_message_by_sequence(partition_id, props)
