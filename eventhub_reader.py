@@ -107,51 +107,59 @@ class LatestMessageReader:
                 last_offset = props_dict.get('lastEnqueuedOffset')
                 logger.debug(f"Fetched props: sequence {last_seq}, offset {last_offset}")
             
-            # Direct approach: Use the simple receive method instead of receive_batch
-            logger.debug(f"Creating consumer for partition {partition_id} from offset {last_offset}")
+            # Try to get actual message content with aggressive timeout protection
+            logger.debug(f"Attempting to fetch actual message for partition {partition_id}")
             
-            # Create partition consumer for direct access
-            from azure.eventhub._consumer import PartitionConsumer
+            # Try multiple approaches to get the message, starting with fastest
+            message_retrieved = False
             
-            # Use the offset approach which is more reliable than sequence number
+            # Approach 1: Try receive_batch with very short timeout
             try:
-                # Create consumer starting from the last offset
-                consumer = self.client._create_consumer(
-                    consumer_group=self.consumer_group,
+                logger.debug(f"Trying receive_batch with 1s timeout for partition {partition_id}")
+                events = self.client.receive_batch(
                     partition_id=partition_id,
-                    event_position=last_offset,  # Use offset directly - more reliable
-                    owner_level=None
+                    starting_position=last_offset,
+                    max_batch_size=1,
+                    max_wait_time=1  # Very short timeout
                 )
                 
-                # Receive with short timeout - should be immediate since we know message exists
-                event_found = False
-                for event in consumer.receive(max_wait_time=2, max_batch_size=1):
-                    logger.debug(f"Got event with sequence {event.__dict__.get('sequence_number', 'unknown')}")
-                    self._extract_message_data(event, partition_id)
-                    event_found = True
-                    break  # Only need the first (latest) one
-                
-                consumer.close()
-                
-                if event_found:
-                    return True
+                if events and len(events) > 0:
+                    logger.debug(f"SUCCESS: Got event with sequence {events[0].__dict__.get('sequence_number', 'unknown')}")
+                    self._extract_message_data(events[0], partition_id)
+                    message_retrieved = True
                 else:
-                    logger.info(f"⚠️ No event received in 2s for partition {partition_id}")
-                    # Fall back to showing metadata
-                    self._show_metadata(partition_id, last_seq, last_offset)
-                    return True
+                    logger.debug("No events received in 1s")
                     
-            except ImportError:
-                logger.debug("PartitionConsumer not available, using alternative approach")
-                # Alternative: just show the metadata since we have it
+            except Exception as batch_error:
+                logger.debug(f"receive_batch failed: {str(batch_error)}")
+            
+            # Approach 2: Try with "-1" (latest) position if offset approach failed
+            if not message_retrieved:
+                try:
+                    logger.debug(f"Trying receive_batch with latest position (-1) for partition {partition_id}")
+                    events = self.client.receive_batch(
+                        partition_id=partition_id,
+                        starting_position="-1",  # Latest message
+                        max_batch_size=1,
+                        max_wait_time=1
+                    )
+                    
+                    if events and len(events) > 0:
+                        logger.debug(f"SUCCESS: Got event with sequence {events[0].__dict__.get('sequence_number', 'unknown')}")
+                        self._extract_message_data(events[0], partition_id)
+                        message_retrieved = True
+                    else:
+                        logger.debug("No events received with latest position")
+                        
+                except Exception as latest_error:
+                    logger.debug(f"Latest position approach failed: {str(latest_error)}")
+            
+            # Final fallback: Show metadata if message retrieval failed
+            if not message_retrieved:
+                logger.info("⚠️ Could not retrieve message content in 2s, showing metadata")
                 self._show_metadata(partition_id, last_seq, last_offset)
-                return True
-                
-            except Exception as consumer_error:
-                logger.warning(f"Consumer approach failed: {str(consumer_error)}")
-                # Fall back to showing metadata
-                self._show_metadata(partition_id, last_seq, last_offset)
-                return True
+            
+            return True
                 
         except Exception as e:
             logger.error(f"Error getting message by sequence for partition {partition_id}: {str(e)}")
