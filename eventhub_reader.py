@@ -1,8 +1,11 @@
 import logging
 from typing import Dict, Any, Optional, List
-from azure.eventhub import EventHubConsumerClient
-from datetime import datetime, timedelta
+from azure.eventhub import EventHubConsumerClient, EventPosition
+from datetime import datetime, timezone
 import time
+
+# Import centralized logging config (auto-configures on import)
+from .logging_config import configure_logging
 
 logger = logging.getLogger("EventHubReader")
 
@@ -19,14 +22,14 @@ class LatestMessageReader:
     def connect(self):
         """Connect to Event Hub"""
         try:
-            self. client = EventHubConsumerClient.from_connection_string(
+            self.client = EventHubConsumerClient.from_connection_string(
                 conn_str=self.connection_string,
                 consumer_group=self.consumer_group,
                 eventhub_name=self.eventhub_name
             )
-            logger. info(f"Connected to Event Hub:  {self.eventhub_name}")
-        except Exception as e: 
-            logger.error(f"Failed to connect to Event Hub {self.eventhub_name}:  {str(e)}")
+            logger.info(f"Connected to Event Hub: {self.eventhub_name}")
+        except Exception as e:
+            logger.error(f"Failed to connect to Event Hub {self.eventhub_name}: {str(e)}")
             raise
     
     def disconnect(self):
@@ -37,14 +40,14 @@ class LatestMessageReader:
     
     def get_partition_ids(self) -> List[str]:
         """Get all partition IDs for the Event Hub"""
-        try:
+        try: 
             if not self.client:
                 self.connect()
             
             partition_ids = self.client.get_partition_ids()
             return list(partition_ids)
         except Exception as e:
-            logger. error(f"Error getting partition IDs: {str(e)}")
+            logger.error(f"Error getting partition IDs: {str(e)}")
             return []
     
     def get_partition_properties(self, partition_id: str) -> Dict[str, Any]:
@@ -55,139 +58,183 @@ class LatestMessageReader:
             
             props = self.client.get_partition_properties(partition_id)
             
+            # Convert props object to dictionary and safely get values
+            props_dict = {
+                "partition_id": getattr(props, 'partition_id', partition_id),
+                "beginning_sequence_number": getattr(props, 'beginning_sequence_number', None),
+                "last_enqueued_sequence_number": getattr(props, 'last_enqueued_sequence_number', None),
+                "last_enqueued_offset": getattr(props, 'last_enqueued_offset', None),
+                "last_enqueued_time_utc": getattr(props, 'last_enqueued_time_utc', None),
+                "is_empty": getattr(props, 'is_empty', True)
+            }
+            
             return {
                 "partitionId": partition_id,
-                "beginningSequenceNumber": props.beginning_sequence_number,
-                "lastEnqueuedSequenceNumber": props.last_enqueued_sequence_number,
-                "lastEnqueuedOffset": props.last_enqueued_offset,
-                "lastEnqueuedTimeUtc": props.last_enqueued_time_utc. isoformat() if props.last_enqueued_time_utc else None,
-                "isEmpty": props.is_empty
+                "beginningSequenceNumber": props_dict.get("beginning_sequence_number"),
+                "lastEnqueuedSequenceNumber": props_dict.get("last_enqueued_sequence_number"),
+                "lastEnqueuedOffset": props_dict.get("last_enqueued_offset"),
+                "lastEnqueuedTimeUtc": props_dict.get("last_enqueued_time_utc").isoformat() if props_dict.get("last_enqueued_time_utc") else None,
+                "isEmpty": props_dict.get("is_empty", True)
             }
         except Exception as e:
             logger.error(f"Error getting partition properties for {partition_id}: {str(e)}")
             return None
     
-    def get_latest_message(self, partition_id: str, timeout_seconds: int = 10) -> Optional[Dict[str, Any]]:
+    def get_latest_message_batch(self, partition_id: str) -> bool:
         """
-        Get the latest message from a specific partition
+        Get the latest message using batch approach with lastEnqueuedOffset
+        Much faster than streaming - directly fetches the specific message
         
         Args:
             partition_id: The partition to read from
-            timeout_seconds: Maximum time to wait for a message
         
         Returns:
             Dictionary with message details or None if no message found
         """
-        try: 
+        try:
             if not self.client:
                 self.connect()
             
-            # Get partition properties to check if empty
-            partition_props = self. client.get_partition_properties(partition_id)
+            # Get partition properties to find the latest offset
+            partition_props = self.client.get_partition_properties(partition_id)
             
-            if partition_props. is_empty:
-                logger. info(f"Partition {partition_id} is empty")
+            if getattr(partition_props, 'is_empty', True):
+                logger.debug(f"Partition {partition_id} is empty")
                 return None
             
-            # Store the latest message
-            latest_message = None
-            message_received = False
+            logger.debug(
+                f"Partition {partition_id}: LastSeq={getattr(partition_props, 'last_enqueued_sequence_number', 'unknown')}, "
+                f"LastOffset={getattr(partition_props, 'last_enqueued_offset', 'unknown')}"
+            )
             
-            def on_event(partition_context, event):
-                """Callback to receive events"""
-                nonlocal latest_message, message_received
-                
-                if event: 
-                    latest_message = self._extract_message_data(event, partition_id)
-                    message_received = True
-            
-            def on_error(partition_context, error):
-                """Callback for errors"""
-                logger.error(f"Error receiving from partition {partition_id}: {error}")
-            
-            # Receive from the latest position (last message)
-            # starting_position="-1" means start from the end (latest)
-            with self.client:
-                # Create receiver that starts from the latest offset
-                self.client.receive(
-                    on_event=on_event,
-                    on_error=on_error,
+            # Use receive_batch to get exactly 1 message from the last offset
+            # This is much faster than streaming
+            try:
+                events = self.client.receive_batch(
                     partition_id=partition_id,
-                    starting_position="-1",  # Start from end (latest message)
-                    max_wait_time=timeout_seconds
+                    starting_position=EventPosition(offset=getattr(partition_props, 'last_enqueued_offset'), inclusive=True),
+                    max_batch_size=1,
+                    max_wait_time=3  # Short timeout since we know the message exists
                 )
+                
+                if events:
+                    event = events[0]  # Get the single latest message
+                    self._extract_message_data(event, partition_id)
+                    logger.debug(f"✓ Retrieved latest message from partition {partition_id}")
+                    return True  # Return True to indicate success
+                else:
+                    logger.debug(f"No message retrieved from partition {partition_id} (likely at tail)")
+                    return False
+                    
+            except Exception as batch_error:
+                logger.warning(f"Batch retrieval failed for partition {partition_id}: {str(batch_error)}")
+                return None
             
-            if not message_received:
-                logger. info(f"No new messages received from partition {partition_id} within timeout")
-                # If no new message, try to get from the last offset
-                return self._get_message_at_offset(partition_id, partition_props.last_enqueued_offset)
-            
-            return latest_message
-        
-        except Exception as e: 
-            logger.error(f"Error getting latest message from partition {partition_id}: {str(e)}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Error getting latest message from partition {partition_id}: {str(e)}")
             return None
     
-    def _get_message_at_offset(self, partition_id: str, offset: str, timeout_seconds: int = 5) -> Optional[Dict[str, Any]]:
+    def get_latest_message_by_sequence(self, partition_id: str, partition_props: Dict[str, Any] = None) -> bool:
         """
-        Get message at a specific offset
+        Get latest message using lastEnqueuedSequenceNumber
         
-        Args: 
-            partition_id: The partition ID
-            offset: The offset to read from
-            timeout_seconds:  Timeout for reading
+        Args:
+            partition_id: The partition to read from
+            partition_props: Optional partition properties dict to avoid re-fetching
         
         Returns:
-            Message data or None
+            Dictionary with message details or None if no message found
         """
         try:
-            message_data = None
+            if not self.client:
+                self.connect()
             
-            def on_event(partition_context, event):
-                nonlocal message_data
-                if event:
-                    message_data = self._extract_message_data(event, partition_id)
+            # Use provided props or fetch them
+            if partition_props:
+                is_empty = partition_props.get('isEmpty', True)
+                last_seq = partition_props.get('lastEnqueuedSequenceNumber')
+                
+                if is_empty:
+                    logger.debug(f"Partition {partition_id} is empty")
+                    return None
+                    
+                logger.debug(f"Using provided props: sequence {last_seq}")
+            else:
+                # Fallback to fetching props if not provided
+                props_obj = self.client.get_partition_properties(partition_id)
+                
+                if getattr(props_obj, 'is_empty', True):
+                    logger.debug(f"Partition {partition_id} is empty")
+                    return None
+                
+                last_seq = getattr(props_obj, 'last_enqueued_sequence_number')
+                logger.debug(f"Fetched props: sequence {last_seq}")
             
-            def on_error(partition_context, error):
-                logger.debug(f"Error reading at offset {offset}: {error}")
-            
-            with self.client:
-                self. client.receive(
-                    on_event=on_event,
-                    on_error=on_error,
+            # Use sequence number to fetch the exact latest message
+            try:
+                events = self.client.receive_batch(
                     partition_id=partition_id,
-                    starting_position=offset,  # Start from specific offset
-                    max_wait_time=timeout_seconds
+                    starting_position=EventPosition(sequence_number=last_seq, inclusive=True),
+                    max_batch_size=1,
+                    max_wait_time=3
                 )
-            
-            return message_data
-        
+                
+                if events:
+                    event = events[0]
+                    self._extract_message_data(event, partition_id)
+                    logger.debug(f"✓ Retrieved message by sequence from partition {partition_id}")
+                    return True  # Return True to indicate success
+                else:
+                    logger.debug(f"No message found at sequence {last_seq}")
+                    return False
+                    
+            except Exception as batch_error:
+                logger.warning(f"Sequence-based retrieval failed for partition {partition_id}: {str(batch_error)}")
+                return None
+                
         except Exception as e:
-            logger.debug(f"Could not read message at offset {offset}:  {str(e)}")
+            logger.error(f"Error getting message by sequence for partition {partition_id}: {str(e)}")
             return None
     
-    def get_latest_message_from_all_partitions(self, timeout_per_partition: int = 10) -> List[Dict[str, Any]]:
+    def get_latest_message_from_all_partitions_batch(self) -> List[Dict[str, Any]]:
         """
-        Get the latest message from all partitions
+        Get latest message from all partitions using fast batch approach
+        Much faster than streaming - completes in seconds instead of minutes
         
         Returns:
             List of message dictionaries, one per partition (if available)
         """
         results = []
+        start_time = time.time()
         
         try:
             # Get all partition IDs
             partition_ids = self.get_partition_ids()
-            logger.info(f"Found {len(partition_ids)} partitions in Event Hub:  {self.eventhub_name}")
+            logger.info(f"Found {len(partition_ids)} partitions in Event Hub: {self.eventhub_name}")
+            
+            if not partition_ids:
+                logger.warning(f"No partitions found for EventHub {self.eventhub_name}")
+                return results
             
             for partition_id in partition_ids:
-                logger.info(f"Reading latest message from partition {partition_id}...")
+                partition_start = time.time()
                 
-                # Get partition properties first
-                partition_props = self. get_partition_properties(partition_id)
+                # Get partition properties first (fast operation)
+                partition_props = self.get_partition_properties(partition_id)
                 
-                if partition_props and partition_props["isEmpty"]:
-                    logger.info(f"Partition {partition_id} is empty - no messages to read")
+                if not partition_props:
+                    logger.warning(f"Could not get properties for partition {partition_id}")
+                    results.append({
+                        "eventhubName": self.eventhub_name,
+                        "partitionId": partition_id,
+                        "status": "error",
+                        "partitionProperties": None,
+                        "message": None
+                    })
+                    continue
+                
+                if partition_props.get("isEmpty", True):
+                    logger.debug(f"Partition {partition_id} is empty")
                     results.append({
                         "eventhubName": self.eventhub_name,
                         "partitionId": partition_id,
@@ -197,265 +244,56 @@ class LatestMessageReader:
                     })
                     continue
                 
-                # Get the latest message
-                message = self.get_latest_message(partition_id, timeout_per_partition)
+                # Use batch method to get latest message (fast!)
+                message = self.get_latest_message_batch(partition_id)
+                
+                partition_time = time.time() - partition_start
+                status = "success" if message else "no_message"
                 
                 results.append({
                     "eventhubName": self.eventhub_name,
                     "partitionId": partition_id,
-                    "status": "success" if message else "no_message",
+                    "status": status,
                     "partitionProperties": partition_props,
-                    "message": message
+                    "message": message,
+                    "processingTimeMs": round(partition_time * 1000, 2)
                 })
+                
+                logger.debug(f"Partition {partition_id} processed in {partition_time:.3f}s")
         
-        except Exception as e: 
-            logger.error(f"Error getting latest messages:  {str(e)}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Error getting latest messages: {str(e)}")
         
+        total_time = time.time() - start_time
+        logger.info(f"Batch processing completed in {total_time:.2f}s for {len(partition_ids)} partitions")
         return results
     
-    def _extract_message_data(self, event, partition_id: str) -> Dict[str, Any]:
-        """Extract all metadata and payload from an event"""
-        try:
-            # Get raw payload
-            raw_payload_bytes = event.body_as_bytes()
-            payload_size = len(raw_payload_bytes)
-            
-            # Decode and truncate payload
-            try:
-                raw_payload = raw_payload_bytes. decode('utf-8')
-                payload_truncated = raw_payload[:1000] + ("..." if len(raw_payload) > 1000 else "")
-            except UnicodeDecodeError:
-                payload_truncated = f"<binary data:  {raw_payload_bytes[: 100]. hex()}...>"
-            
-            # Extract system properties
-            system_properties = {}
-            if hasattr(event, 'system_properties') and event.system_properties:
-                system_properties = dict(event.system_properties)
-            
-            # Extract user properties
-            user_properties = {}
-            if hasattr(event, 'properties') and event.properties:
-                user_properties = dict(event. properties)
-            
-            message_data = {
-                "eventhubName": self.eventhub_name,
-                "partitionId": partition_id,
-                "sequenceNumber": event.sequence_number,
-                "offset": event. offset,
-                "enqueuedTime": event.enqueued_time.isoformat() if event.enqueued_time else None,
-                "partitionKey": event.partition_key,
-                "retrievedAt": datetime.utcnow().isoformat(),
-                "payload": {
-                    "truncated": payload_truncated,
-                    "sizeBytes": payload_size
-                },
-                "systemProperties": {
-                    "correlationId": system_properties.get('correlation-id'),
-                    "messageId": system_properties.get('message-id'),
-                    "contentType": system_properties.get('content-type'),
-                    "contentEncoding": system_properties.get('content-encoding'),
-                    "all": system_properties
-                },
-                "userProperties": user_properties
-            }
-            
-            return message_data
-        
-        except Exception as e:
-            logger. error(f"Error extracting message data: {str(e)}")
-            return {
-                "error": str(e),
-                "partitionId": partition_id
-            }
-
-
-class EventHubStreamReader:
-    """
-    Alternative reader that reads recent messages (last N seconds)
-    More reliable than trying to get exactly the latest message
-    """
-    
-    def __init__(self, connection_string: str, eventhub_name: str, consumer_group:  str = "$Default"):
-        self.connection_string = connection_string
-        self.eventhub_name = eventhub_name
-        self.consumer_group = consumer_group
-        self.client = None
-    
-    def connect(self):
-        """Connect to Event Hub"""
-        try:
-            self.client = EventHubConsumerClient. from_connection_string(
-                conn_str=self.connection_string,
-                consumer_group=self.consumer_group,
-                eventhub_name=self. eventhub_name
-            )
-            logger.info(f"Connected to Event Hub: {self. eventhub_name}")
-        except Exception as e:
-            logger.error(f"Failed to connect to Event Hub {self.eventhub_name}: {str(e)}")
-            raise
-    
-    def disconnect(self):
-        """Disconnect from Event Hub"""
-        if self.client:
-            self.client.close()
-            logger.info(f"Disconnected from Event Hub: {self. eventhub_name}")
-    
-    def get_recent_messages(self, partition_id: str, lookback_seconds: int = 300, max_messages: int = 10) -> List[Dict[str, Any]]:
-        """
-        Get recent messages from a partition (last N seconds)
-        
-        Args:
-            partition_id:  Partition to read from
-            lookback_seconds: How many seconds to look back (default: 5 minutes)
-            max_messages: Maximum messages to retrieve
-        
-        Returns:
-            List of messages (newest first)
-        """
-        try:
-            if not self.client:
-                self.connect()
-            
-            messages = []
-            
-            # Calculate starting time
-            starting_time = datetime.utcnow() - timedelta(seconds=lookback_seconds)
-            
-            def on_event(partition_context, event):
-                if event:
-                    # Extract message data
-                    raw_payload_bytes = event.body_as_bytes()
-                    
-                    try:
-                        raw_payload = raw_payload_bytes.decode('utf-8')
-                        payload_truncated = raw_payload[:1000] + ("..." if len(raw_payload) > 1000 else "")
-                    except UnicodeDecodeError:
-                        payload_truncated = f"<binary data: {raw_payload_bytes[: 100].hex()}...>"
-                    
-                    system_properties = dict(event.system_properties) if event.system_properties else {}
-                    user_properties = dict(event.properties) if event.properties else {}
-                    
-                    message_data = {
-                        "eventhubName": self.eventhub_name,
-                        "partitionId": partition_id,
-                        "sequenceNumber": event.sequence_number,
-                        "offset": event.offset,
-                        "enqueuedTime": event.enqueued_time.isoformat() if event.enqueued_time else None,
-                        "partitionKey": event.partition_key,
-                        "retrievedAt": datetime.utcnow().isoformat(),
-                        "payload":  {
-                            "truncated":  payload_truncated,
-                            "sizeBytes": len(raw_payload_bytes)
-                        },
-                        "systemProperties":  {
-                            "correlationId": system_properties.get('correlation-id'),
-                            "messageId": system_properties.get('message-id'),
-                            "contentType": system_properties.get('content-type'),
-                            "all": system_properties
-                        },
-                        "userProperties": user_properties
-                    }
-                    
-                    messages.append(message_data)
-                    
-                    # Stop if we have enough messages
-                    if len(messages) >= max_messages:
-                        return
-            
-            def on_error(partition_context, error):
-                logger.error(f"Error receiving from partition {partition_id}: {error}")
-            
-            # Receive messages starting from the specified time
-            with self.client:
-                self.client.receive(
-                    on_event=on_event,
-                    on_error=on_error,
-                    partition_id=partition_id,
-                    starting_position=starting_time.isoformat(),  # Start from timestamp
-                    max_wait_time=10
-                )
-            
-            # Sort by sequence number (descending) to get latest first
-            messages.sort(key=lambda x: x["sequenceNumber"], reverse=True)
-            
-            logger.info(f"Retrieved {len(messages)} recent messages from partition {partition_id}")
-            return messages
-        
-        except Exception as e: 
-            logger.error(f"Error getting recent messages from partition {partition_id}: {str(e)}", exc_info=True)
-            return []
-    
-    def get_latest_from_partition(self, partition_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get the single latest message from a partition
-        
-        Args:
-            partition_id: Partition to read from
-        
-        Returns:
-            Latest message or None
-        """
-        messages = self.get_recent_messages(partition_id, lookback_seconds=600, max_messages=1)
-        return messages[0] if messages else None
-    
-    def get_latest_from_all_partitions(self, lookback_seconds: int = 300) -> List[Dict[str, Any]]:
-        """
-        Get latest message from all partitions
-        
-        Args:
-            lookback_seconds:  How many seconds to look back
-        
-        Returns:
-            List of results per partition
-        """
-        results = []
-        
+    def _extract_message_data(self, event, partition_id: str) -> None:
+        """Extract and print message data in simple format"""
         try: 
-            if not self.client:
-                self.connect()
+            # Get basic event info
+            sequence_number = getattr(event, 'sequence_number', None)
+            offset = getattr(event, 'offset', None)
+            enqueued_time = getattr(event, 'enqueued_time', None)
+            partition_key = getattr(event, 'partition_key', None)
             
-            # Get all partition IDs
-            partition_ids = self.client.get_partition_ids()
-            logger.info(f"Found {len(partition_ids)} partitions in Event Hub: {self. eventhub_name}")
+            # Get message content as string
+            raw_payload_bytes = getattr(event, 'body_as_bytes', lambda: b'')()
+            try:
+                message_content = raw_payload_bytes.decode('utf-8')
+            except UnicodeDecodeError:
+                message_content = f"<binary data: {raw_payload_bytes[:100].hex()}>"
             
-            for partition_id in partition_ids:
-                logger.info(f"Reading latest message from partition {partition_id}...")
-                
-                # Get partition properties
-                partition_props = self.client.get_partition_properties(partition_id)
-                
-                partition_info = {
-                    "partitionId": partition_id,
-                    "beginningSequenceNumber": partition_props.beginning_sequence_number,
-                    "lastEnqueuedSequenceNumber": partition_props. last_enqueued_sequence_number,
-                    "lastEnqueuedOffset": partition_props.last_enqueued_offset,
-                    "lastEnqueuedTimeUtc": partition_props.last_enqueued_time_utc.isoformat() if partition_props.last_enqueued_time_utc else None,
-                    "isEmpty": partition_props.is_empty
-                }
-                
-                if partition_props.is_empty:
-                    logger.info(f"Partition {partition_id} is empty")
-                    results.append({
-                        "eventhubName": self.eventhub_name,
-                        "partitionId": partition_id,
-                        "status": "empty",
-                        "partitionProperties": partition_info,
-                        "message":  None
-                    })
-                    continue
-                
-                # Get latest message
-                message = self.get_latest_from_partition(partition_id)
-                
-                results.append({
-                    "eventhubName": self.eventhub_name,
-                    "partitionId": partition_id,
-                    "status": "success" if message else "no_message",
-                    "partitionProperties": partition_info,
-                    "message": message
-                })
-        
-        except Exception as e: 
-            logger.error(f"Error getting latest messages from all partitions: {str(e)}", exc_info=True)
-        
-        return results
+            # Print message info directly
+            logger.info(f"✅ Latest Message Details:")
+            logger.info(f"   Topic: {self.eventhub_name}")
+            logger.info(f"   Partition: {partition_id}")
+            logger.info(f"   Sequence: {sequence_number}")
+            logger.info(f"   Offset: {offset}")
+            logger.info(f"   EnqueuedTime: {enqueued_time}")
+            logger.info(f"   PartitionKey: {partition_key}")
+            logger.info(f"   MessageSize: {len(raw_payload_bytes)} bytes")
+            logger.info(f"   Content: {message_content}")
+            
+        except Exception as e:
+            logger.error(f"Error extracting message data: {str(e)}")
