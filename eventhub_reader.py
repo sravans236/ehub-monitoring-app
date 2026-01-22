@@ -1,6 +1,11 @@
 import logging
 from typing import Dict, Any, Optional, List
-from azure.eventhub import EventHubConsumerClient, EventPosition
+from azure.eventhub import EventHubConsumerClient
+try:
+    from azure.eventhub import EventPosition
+except ImportError:
+    # For newer SDK versions, use string positions
+    EventPosition = None
 from datetime import datetime, timezone
 import time
 
@@ -110,9 +115,19 @@ class LatestMessageReader:
             # Use receive_batch to get exactly 1 message from the last offset
             # This is much faster than streaming
             try:
+                last_offset = getattr(partition_props, 'last_enqueued_offset')
+                
+                # Handle different SDK versions
+                if EventPosition:
+                    # Older SDK version
+                    starting_position = EventPosition(offset=last_offset, inclusive=True)
+                else:
+                    # Newer SDK version - use offset directly
+                    starting_position = last_offset
+                
                 events = self.client.receive_batch(
                     partition_id=partition_id,
-                    starting_position=EventPosition(offset=getattr(partition_props, 'last_enqueued_offset'), inclusive=True),
+                    starting_position=starting_position,
                     max_batch_size=1,
                     max_wait_time=3  # Short timeout since we know the message exists
                 )
@@ -172,9 +187,17 @@ class LatestMessageReader:
             
             # Use sequence number to fetch the exact latest message
             try:
+                # Handle different SDK versions  
+                if EventPosition:
+                    # Older SDK version
+                    starting_position = EventPosition(sequence_number=last_seq, inclusive=True)
+                else:
+                    # Newer SDK version - use sequence number directly
+                    starting_position = last_seq
+                
                 events = self.client.receive_batch(
                     partition_id=partition_id,
-                    starting_position=EventPosition(sequence_number=last_seq, inclusive=True),
+                    starting_position=starting_position,
                     max_batch_size=1,
                     max_wait_time=3
                 )
