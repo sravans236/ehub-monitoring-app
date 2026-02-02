@@ -1,0 +1,245 @@
+"""
+Comprehensive EventHub Monitoring Function
+Azure Function that performs comprehensive monitoring of EventHub namespace
+with detailed consumer group lag analysis and structured logging
+"""
+
+import logging
+import azure.functions as func
+from datetime import datetime
+import time
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
+# Import centralized logging config (auto-configures on import)
+from utils.logging_config import configure_logging
+
+from utils.comprehensive_monitor import (
+    ComprehensiveEventHubMonitor,
+    ComprehensiveMonitorLogger
+)
+
+
+def main(timer: func.TimerRequest) -> None:
+    """
+    Timer-triggered function for comprehensive EventHub monitoring
+    
+    Runs every 5 minutes to monitor:
+    - All EventHubs in namespace
+    - All partitions for each EventHub
+    - All consumer groups for each EventHub  
+    - Detailed lag metrics for each consumer group/partition
+    - Rich structured logging with data classes
+    """
+    logger = logging.getLogger("ComprehensiveEventHubMonitor")
+    
+    # Check if timer is past due
+    if timer.past_due:
+        logger.info('⏰ The timer is past due!')
+    
+    logger.info("🚀 Starting comprehensive EventHub namespace monitoring...")
+    start_time = time.time()
+    
+    # Get configuration from environment
+    connection_string = os.environ.get("EventHubConnectionString")
+    resource_group = os.environ.get("ResourceGroup")
+    subscription_id = os.environ.get("SubscriptionId")
+    storage_connection_string = os.environ.get("StorageConnectionString")
+    
+    # Validate required configuration
+    if not connection_string:
+        logger.error("❌ EventHubConnectionString environment variable is required")
+        return
+    
+    # Log configuration
+    logger.info("🔧 Configuration:")
+    logger.info(f"  Subscription ID: {subscription_id or 'Not provided'}")
+    logger.info(f"  Resource Group: {resource_group or 'Not provided'}")
+    logger.info(f"  Storage Connection: {'Configured' if storage_connection_string else 'Not configured'}")
+    
+    if not storage_connection_string:
+        logger.warning("⚠️  Storage connection string not provided - checkpoint analysis will be limited")
+    
+    try:
+        # Initialize comprehensive monitor
+        monitor = ComprehensiveEventHubMonitor(
+            connection_string=connection_string,
+            subscription_id=subscription_id,
+            resource_group=resource_group,
+            storage_connection_string=storage_connection_string,
+            max_workers=8  # Parallel processing for better performance
+        )
+        
+        # Initialize enhanced logger
+        monitor_logger = ComprehensiveMonitorLogger(logger)
+        
+        logger.info(f"📡 Monitoring namespace: {monitor.namespace}")
+        
+        # Perform comprehensive monitoring
+        namespace_metrics = monitor.monitor_namespace()
+        
+        processing_time = time.time() - start_time
+        
+        # Log comprehensive results using structured logging
+        log_monitoring_results(logger, monitor_logger, namespace_metrics, processing_time)
+        
+        # Clean up resources
+        monitor.close_all_clients()
+        
+        logger.info(f"✅ Comprehensive monitoring completed in {processing_time:.2f} seconds")
+        logger.info(f"📊 Summary: {namespace_metrics.total_eventhubs} EventHubs, "
+                   f"{namespace_metrics.total_partitions} partitions, "
+                   f"{namespace_metrics.total_consumer_groups} consumer groups")
+        
+    except Exception as e:
+        processing_time = time.time() - start_time
+        logger.error(f"❌ Error during comprehensive monitoring: {e}", exc_info=True)
+        
+        # Log error summary
+        error_summary = {
+            "eventType": "MonitoringError",
+            "timestamp": datetime.utcnow().isoformat(),
+            "processingTimeSeconds": processing_time,
+            "error": str(e),
+            "configuration": {
+                "hasConnectionString": bool(connection_string),
+                "hasSubscriptionId": bool(subscription_id),
+                "hasResourceGroup": bool(resource_group),
+                "hasStorageConnection": bool(storage_connection_string)
+            }
+        }
+        
+        import json
+        logger.error(f"Monitoring Error Summary: {json.dumps(error_summary)}")
+
+
+def log_monitoring_results(logger: logging.Logger, 
+                         monitor_logger: ComprehensiveMonitorLogger,
+                         namespace_metrics, 
+                         processing_time: float):
+    """Log comprehensive monitoring results with rich structured data"""
+    
+    # 1. Log namespace overview with structured data
+    logger.info("📊 NAMESPACE MONITORING RESULTS")
+    logger.info("=" * 50)
+    logger.info(f"Namespace: {namespace_metrics.namespace}")
+    logger.info(f"Discovery Method: {namespace_metrics.discovery_method}")
+    logger.info(f"Processing Time: {processing_time:.2f} seconds")
+    logger.info(f"EventHubs Discovered: {namespace_metrics.total_eventhubs}")
+    logger.info(f"Total Partitions: {namespace_metrics.total_partitions}")
+    logger.info(f"Total Consumer Groups: {namespace_metrics.total_consumer_groups}")
+    
+    # Log structured namespace metrics
+    monitor_logger.log_namespace_metrics(namespace_metrics)
+    
+    # 2. Log summary for each EventHub
+    for eh_metrics in namespace_metrics.eventhubs:
+        logger.info(f"\n🎯 EventHub: {eh_metrics.hub_name}")
+        logger.info(f"  Partitions: {eh_metrics.partition_count}")
+        logger.info(f"  Consumer Groups: {eh_metrics.total_consumer_groups}")
+        logger.info(f"  Healthy Consumer Groups: {eh_metrics.healthy_consumer_groups}")
+        logger.info(f"  Status: {eh_metrics.status}")
+        
+        # Log structured EventHub metrics
+        monitor_logger.log_eventhub_metrics(eh_metrics)
+        
+        # 3. Log consumer group health summary
+        for cg_metrics in eh_metrics.consumer_groups:
+            health_status = get_health_status(cg_metrics.health_score)
+            logger.info(f"    👥 Consumer Group '{cg_metrics.consumer_group}': {health_status}")
+            logger.info(f"       Health Score: {cg_metrics.health_score:.1f}%")
+            logger.info(f"       Max Lag: {cg_metrics.max_sequence_lag} messages")
+            logger.info(f"       Healthy Partitions: {cg_metrics.healthy_partitions}/{cg_metrics.total_partitions}")
+            
+            if cg_metrics.partitions_with_errors > 0:
+                logger.warning(f"       ⚠️  {cg_metrics.partitions_with_errors} partitions have errors")
+            if cg_metrics.partitions_without_checkpoints > 0:
+                logger.warning(f"       ⚠️  {cg_metrics.partitions_without_checkpoints} partitions without checkpoints")
+            
+            # Log detailed consumer group metrics
+            monitor_logger.log_consumer_group_lag(cg_metrics)
+    
+    # 4. Log overall health summary
+    total_cgs = namespace_metrics.total_consumer_groups
+    healthy_cgs = sum(eh.healthy_consumer_groups for eh in namespace_metrics.eventhubs)
+    
+    if total_cgs > 0:
+        overall_health = (healthy_cgs / total_cgs) * 100
+        health_status = get_health_status(overall_health)
+        logger.info(f"\n🏥 OVERALL HEALTH: {health_status}")
+        logger.info(f"   {healthy_cgs}/{total_cgs} consumer groups healthy ({overall_health:.1f}%)")
+    
+    # 5. Log monitoring summary
+    monitor_logger.log_monitoring_summary(processing_time, namespace_metrics)
+    
+    # 6. Log alerts for unhealthy consumer groups
+    log_health_alerts(logger, namespace_metrics)
+
+
+def get_health_status(health_score: float) -> str:
+    """Get health status with emoji based on health score"""
+    if health_score >= 90:
+        return f"✅ HEALTHY ({health_score:.1f}%)"
+    elif health_score >= 70:
+        return f"⚠️  WARNING ({health_score:.1f}%)"
+    else:
+        return f"❌ CRITICAL ({health_score:.1f}%)"
+
+
+def log_health_alerts(logger: logging.Logger, namespace_metrics):
+    """Log alerts for consumer groups with health issues"""
+    alerts = []
+    
+    for eh_metrics in namespace_metrics.eventhubs:
+        for cg_metrics in eh_metrics.consumer_groups:
+            if cg_metrics.health_score < 70:  # Critical threshold
+                alerts.append({
+                    "severity": "CRITICAL" if cg_metrics.health_score < 50 else "WARNING",
+                    "eventhub": eh_metrics.hub_name,
+                    "consumerGroup": cg_metrics.consumer_group,
+                    "healthScore": cg_metrics.health_score,
+                    "maxLag": cg_metrics.max_sequence_lag,
+                    "partitionsWithErrors": cg_metrics.partitions_with_errors,
+                    "partitionsWithoutCheckpoints": cg_metrics.partitions_without_checkpoints
+                })
+    
+    if alerts:
+        logger.warning(f"🚨 HEALTH ALERTS: {len(alerts)} consumer groups need attention")
+        
+        for alert in alerts:
+            severity_emoji = "🔴" if alert["severity"] == "CRITICAL" else "⚠️"
+            logger.warning(f"{severity_emoji} {alert['severity']}: "
+                         f"EventHub '{alert['eventhub']}', "
+                         f"Consumer Group '{alert['consumerGroup']}' - "
+                         f"Health: {alert['healthScore']:.1f}%, "
+                         f"Max Lag: {alert['maxLag']}")
+        
+        # Log structured alert data
+        import json
+        alert_log = {
+            "eventType": "HealthAlerts",
+            "timestamp": datetime.utcnow().isoformat(),
+            "namespace": namespace_metrics.namespace,
+            "alertCount": len(alerts),
+            "alerts": alerts
+        }
+        logger.warning(f"Health Alerts: {json.dumps(alert_log)}")
+    else:
+        logger.info("✅ No health alerts - all consumer groups are healthy!")
+
+
+if __name__ == "__main__":
+    """For local testing purposes"""
+    class TimerRequest:
+        """Mock TimerRequest for local testing"""
+        def __init__(self, past_due=False):
+            self.past_due = past_due
+    
+    # Configure logging
+    configure_logging()
+    
+    # Run main function with mock timer
+    main(TimerRequest())
