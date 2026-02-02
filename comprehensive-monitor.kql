@@ -1,0 +1,390 @@
+// Enhanced KQL Queries for Comprehensive EventHub Monitoring
+// Use these queries in Application Insights to analyze your comprehensive monitoring data
+
+// Query 1: Comprehensive Namespace Overview - Latest Status
+traces
+| where timestamp > ago(1h)
+| where message contains "Namespace Comprehensive Metrics"
+| extend logData = parse_json(substring(message, indexof(message, "{")))
+| project 
+    timestamp,
+    namespace = logData.namespace,
+    discoveryMethod = logData.discoveryMethod,
+    totalEventHubs = logData.totals.eventhubs,
+    totalPartitions = logData.totals.partitions,
+    totalConsumerGroups = logData.totals.consumerGroups,
+    subscriptionId = logData.subscriptionId,
+    resourceGroup = logData.resourceGroup,
+    eventhubDetails = logData.eventhubs
+| order by timestamp desc
+| take 1
+
+// Query 2: Partition Message Table - Consumer Group Activity Overview
+traces
+| where timestamp > ago(30m)
+| where message contains "Partition Message Table"
+| extend logData = parse_json(substring(message, indexof(message, "{")))
+| project 
+    timestamp,
+    namespace = tostring(logData.namespace),
+    totalPartitions = toint(logData.totalPartitions),
+    totalMessages = tolong(logData.totalMessages),
+    activePartitions = toint(logData.activePartitions),
+    emptyPartitions = toint(logData.emptyPartitions),
+    partitionData = logData.partitionData
+| mv-expand partition = partitionData
+| project 
+    timestamp,
+    namespace,
+    eventhub = tostring(partition.eventhub),
+    consumerGroup = tostring(partition.consumerGroup),
+    partitionId = tostring(partition.partitionId),
+    totalAvailableMessages = tolong(partition.totalAvailableMessages),
+    isEmpty = tobool(partition.isEmpty),
+    lastEnqueuedTime = todatetime(partition.lastEnqueuedTime),
+    beginningSequenceNumber = tolong(partition.beginningSequenceNumber),
+    lastEnqueuedSequenceNumber = tolong(partition.lastEnqueuedSequenceNumber)
+| extend 
+    status = case(isEmpty == true, "EMPTY", "ACTIVE"),
+    messageVelocity = case(
+        totalAvailableMessages == 0, "No Messages",
+        totalAvailableMessages <= 1000, "Low Volume",
+        totalAvailableMessages <= 10000, "Medium Volume",
+        "High Volume"
+    )
+| order by totalAvailableMessages desc, eventhub asc, consumerGroup asc, partitionId asc
+
+// Query 3: Consumer Group Activity Monitoring - Real-time Status  
+traces
+| where timestamp > ago(30m)
+| where message contains "Consumer Group Activity Detailed"
+| extend logData = parse_json(substring(message, indexof(message, "{")))
+| project 
+    timestamp,
+    namespace = tostring(logData.namespace),
+    hubName = tostring(logData.hubName),
+    consumerGroup = tostring(logData.consumerGroup),
+    activityScore = todouble(logData.activityScore),
+    totalAvailableMessages = tolong(logData.totals.totalAvailableMessages),
+    activePartitions = toint(logData.totals.activePartitions),
+    totalPartitions = toint(logData.totals.partitions),
+    emptyPartitions = toint(logData.totals.emptyPartitions),
+    partitionsWithErrors = toint(logData.totals.partitionsWithErrors)
+| extend 
+    activityStatus = case(
+        activityScore >= 90, "Highly Active",
+        activityScore >= 70, "Moderately Active", 
+        activityScore >= 50, "Low Activity",
+        "Minimal Activity"
+    ),
+    messageCategory = case(
+        totalAvailableMessages == 0, "No Messages",
+        totalAvailableMessages <= 1000, "Low Volume",
+        totalAvailableMessages <= 10000, "Medium Volume",
+        "High Volume"
+    )
+| order by activityScore desc, totalAvailableMessages desc
+
+// Query 4: High-Priority Alerts - Critical Consumer Groups
+traces
+| where timestamp > ago(30m)
+| where message contains "Consumer Group Activity Detailed"
+| extend logData = parse_json(substring(message, indexof(message, "{")))
+| project 
+    timestamp,
+    namespace = tostring(logData.namespace),
+    hubName = tostring(logData.hubName),
+    consumerGroup = tostring(logData.consumerGroup),
+    activityScore = todouble(logData.activityScore),
+    partitionsWithErrors = toint(logData.totals.partitionsWithErrors),
+    totalPartitions = toint(logData.totals.partitions),
+    emptyPartitions = toint(logData.totals.emptyPartitions)
+| where activityScore < 70 or partitionsWithErrors > 0
+| extend alertSeverity = case(
+    activityScore < 50 or partitionsWithErrors > 0, "Critical",
+    activityScore < 70, "Warning",
+    "Info"
+)
+| order by activityScore asc, partitionsWithErrors desc
+
+// Query 5: Partition Message Volume Analysis - Top Message Consumers  
+traces
+| where timestamp > ago(1h)
+| where message contains "Partition Message Table"
+| extend logData = parse_json(substring(message, indexof(message, "{")))
+| mv-expand partition = logData.partitionData
+| project 
+    timestamp,
+    namespace = tostring(logData.namespace),
+    eventhub = tostring(partition.eventhub),
+    consumerGroup = tostring(partition.consumerGroup),
+    partitionId = tostring(partition.partitionId),
+    totalAvailableMessages = tolong(partition.totalAvailableMessages),
+    isEmpty = tobool(partition.isEmpty)
+| where totalAvailableMessages > 0
+| summarize 
+    TotalMessages = sum(totalAvailableMessages),
+    ActivePartitions = count(),
+    AvgMessagesPerPartition = avg(totalAvailableMessages),
+    MaxMessagesInPartition = max(totalAvailableMessages)
+    by eventhub, consumerGroup
+| extend 
+    VolumeCategory = case(
+        TotalMessages >= 100000, "Very High Volume",
+        TotalMessages >= 10000, "High Volume", 
+        TotalMessages >= 1000, "Medium Volume",
+        "Low Volume"
+    )
+| order by TotalMessages desc
+
+// Query 6: Partition-Level Activity Analysis - Detailed Breakdown
+traces
+| where timestamp > ago(1h)
+| where message contains "Partition Message Table"
+| extend logData = parse_json(substring(message, indexof(message, "{")))
+| mv-expand partition = logData.partitionData
+| project 
+    timestamp,
+    namespace = tostring(partition.namespace),
+    eventhub = tostring(partition.eventhub),
+    consumerGroup = tostring(partition.consumerGroup),
+    partitionId = tostring(partition.partitionId),
+    totalAvailableMessages = tolong(partition.totalAvailableMessages),
+    isEmpty = tobool(partition.isEmpty),
+    lastEnqueuedTime = todatetime(partition.lastEnqueuedTime),
+    beginningSeq = tolong(partition.beginningSequenceNumber),
+    lastEnqueuedSeq = tolong(partition.lastEnqueuedSequenceNumber)
+| where isnotempty(partitionId)
+| extend 
+    partitionStatus = case(
+        isEmpty == true, "Empty",
+        totalAvailableMessages == 0, "No Messages", 
+        totalAvailableMessages <= 100, "Low Activity",
+        totalAvailableMessages <= 1000, "Moderate Activity",
+        "High Activity"
+    ),
+    messageRange = case(
+        totalAvailableMessages == 0, "0",
+        totalAvailableMessages <= 10, "1-10",
+        totalAvailableMessages <= 100, "11-100", 
+        totalAvailableMessages <= 1000, "101-1K",
+        totalAvailableMessages <= 10000, "1K-10K",
+        "10K+"
+    )
+| order by totalAvailableMessages desc nulls last
+
+// Query 7: EventHub Performance Overview
+traces
+| where timestamp > ago(1h)
+| where message contains "EventHub Comprehensive Metrics"
+| extend logData = parse_json(substring(message, indexof(message, "{")))
+| project 
+    timestamp,
+    namespace = tostring(logData.namespace),
+    hubName = tostring(logData.hubName),
+    partitionCount = toint(logData.partitionCount),
+    consumerGroupCount = toint(logData.consumerGroupCount),
+    activeConsumerGroups = toint(logData.activeConsumerGroups),
+    status = tostring(logData.status),
+    partitionMetrics = logData.partitionMetrics,
+    consumerGroupSummary = logData.consumerGroupSummary
+| extend 
+    overallHealth = todouble(activeConsumerGroups) / todouble(consumerGroupCount) * 100
+| mv-expand cgSummary = consumerGroupSummary
+| project 
+    timestamp, namespace, hubName, partitionCount, status,
+    cgName = tostring(cgSummary.name),
+    cgActivityScore = todouble(cgSummary.activityScore),
+    cgTotalMessages = tolong(cgSummary.totalAvailableMessages),
+    cgActivePartitions = toint(cgSummary.activePartitions),
+    cgTotalPartitions = toint(cgSummary.totalPartitions)
+| order by timestamp desc, cgActivityScore desc
+
+// Query 8: Message Volume Trends - Time Series Analysis
+traces
+| where timestamp > ago(4h)
+| where message contains "Partition Message Table"
+| extend logData = parse_json(substring(message, indexof(message, "{")))
+| project 
+    timestamp,
+    namespace = tostring(logData.namespace),
+    totalMessages = tolong(logData.totalMessages),
+    activePartitions = toint(logData.activePartitions),
+    emptyPartitions = toint(logData.emptyPartitions)
+| extend timeSlot = bin(timestamp, 15m)  // 15-minute bins
+| summarize 
+    AvgTotalMessages = avg(totalMessages),
+    MaxTotalMessages = max(totalMessages),
+    MinTotalMessages = min(totalMessages),
+    AvgActivePartitions = avg(activePartitions)
+    by timeSlot, namespace
+| order by timeSlot desc
+
+// Query 9: Consumer Group Comparison Table (Similar to Console Output)
+traces
+| where timestamp > ago(30m)
+| where message contains "Partition Message Table"
+| extend logData = parse_json(substring(message, indexof(message, "{")))
+| mv-expand partition = logData.partitionData
+| project 
+    namespace = tostring(partition.namespace),
+    eventhub = tostring(partition.eventhub),
+    consumerGroup = tostring(partition.consumerGroup),
+    partitionId = tostring(partition.partitionId),
+    totalAvailableMessages = tolong(partition.totalAvailableMessages),
+    status = case(tobool(partition.isEmpty) == true, "EMPTY", "ACTIVE")
+| summarize by namespace, eventhub, consumerGroup, partitionId, totalAvailableMessages, status
+| order by namespace, eventhub, consumerGroup, partitionId
+| project 
+    Namespace = namespace,
+    EventHub = eventhub, 
+    ['Consumer Group'] = consumerGroup,
+    Partition = partitionId,
+    ['Available Messages'] = totalAvailableMessages,
+    Status = status
+
+// Query 6: Monitoring Performance and Reliability
+traces
+| where timestamp > ago(24h)
+| where message contains "Monitoring Summary"
+| extend logData = parse_json(substring(message, indexof(message, "{")))
+| project 
+    timestamp,
+    namespace = tostring(logData.namespace),
+    processingTimeSeconds = todouble(logData.processingTimeSeconds),
+    discoveredEventHubs = toint(logData.discovered.eventhubs),
+    discoveredPartitions = toint(logData.discovered.partitions),
+    discoveredConsumerGroups = toint(logData.discovered.consumerGroups),
+    totalConsumerGroups = toint(logData.health.totalConsumerGroups),
+    healthyConsumerGroups = toint(logData.health.healthyConsumerGroups)
+| extend 
+    overallHealthPercentage = todouble(healthyConsumerGroups) / todouble(totalConsumerGroups) * 100,
+    performanceCategory = case(
+        processingTimeSeconds <= 30, "Fast",
+        processingTimeSeconds <= 60, "Normal",
+        processingTimeSeconds <= 120, "Slow",
+        "Very Slow"
+    )
+| summarize 
+    AvgProcessingTime = avg(processingTimeSeconds),
+    MaxProcessingTime = max(processingTimeSeconds),
+    MinProcessingTime = min(processingTimeSeconds),
+    AvgHealthPercentage = avg(overallHealthPercentage),
+    MinHealthPercentage = min(overallHealthPercentage),
+    RunCount = count()
+    by bin(timestamp, 1h)
+| order by timestamp desc
+
+// Query 7: Health Alerts Dashboard
+traces
+| where timestamp > ago(6h)
+| where message contains "Health Alerts"
+| extend logData = parse_json(substring(message, indexof(message, "{")))
+| project 
+    timestamp,
+    namespace = tostring(logData.namespace),
+    alertCount = toint(logData.alertCount),
+    alerts = logData.alerts
+| where alertCount > 0
+| mv-expand alert = alerts
+| project 
+    timestamp,
+    namespace,
+    alertSeverity = tostring(alert.severity),
+    eventhub = tostring(alert.eventhub),
+    consumerGroup = tostring(alert.consumerGroup),
+    healthScore = todouble(alert.healthScore),
+    maxLag = tolong(alert.maxLag),
+    partitionsWithErrors = toint(alert.partitionsWithErrors),
+    partitionsWithoutCheckpoints = toint(alert.partitionsWithoutCheckpoints)
+| extend 
+    urgency = case(
+        alertSeverity == "Critical", 1,
+        alertSeverity == "Warning", 2,
+        3
+    )
+| order by timestamp desc, urgency asc
+
+// Query 8: Consumer Group Lag Trends (Time Series)
+traces
+| where timestamp > ago(4h)
+| where message contains "Consumer Group Lag Detailed"
+| extend logData = parse_json(substring(message, indexof(message, "{")))
+| project 
+    timestamp,
+    namespace = tostring(logData.namespace),
+    hubName = tostring(logData.hubName),
+    consumerGroup = tostring(logData.consumerGroup),
+    maxSequenceLag = tolong(logData.aggregates.maxSequenceLag),
+    avgSequenceLag = todouble(logData.aggregates.avgSequenceLag),
+    totalSequenceLag = tolong(logData.aggregates.totalSequenceLag),
+    healthScore = todouble(logData.healthScore)
+| summarize 
+    MaxLag = max(maxSequenceLag),
+    AvgLag = avg(avgSequenceLag),
+    TotalLag = max(totalSequenceLag),
+    AvgHealthScore = avg(healthScore)
+    by namespace, hubName, consumerGroup, bin(timestamp, 15m)
+| order by timestamp desc
+
+// Query 9: Resource Utilization Overview
+traces
+| where timestamp > ago(2h)
+| where message contains "Namespace Comprehensive Metrics"
+| extend logData = parse_json(substring(message, indexof(message, "{")))
+| project 
+    timestamp,
+    namespace = logData.namespace,
+    totalEventHubs = logData.totals.eventhubs,
+    totalPartitions = logData.totals.partitions,
+    totalConsumerGroups = logData.totals.consumerGroups,
+    eventhubDetails = logData.eventhubs
+| mv-expand eh = eventhubDetails
+| extend 
+    hubName = tostring(eh.name),
+    partitionCount = toint(eh.partitionCount),
+    consumerGroupCount = toint(eh.consumerGroupCount),
+    healthyConsumerGroups = toint(eh.healthyConsumerGroups)
+| summarize 
+    TotalEventHubs = dcount(hubName),
+    TotalPartitions = sum(partitionCount),
+    TotalConsumerGroups = sum(consumerGroupCount),
+    TotalHealthyConsumerGroups = sum(healthyConsumerGroups),
+    AvgPartitionsPerHub = avg(partitionCount),
+    AvgConsumerGroupsPerHub = avg(consumerGroupCount)
+    by namespace, bin(timestamp, 1h)
+| extend 
+    OverallHealthPercentage = todouble(TotalHealthyConsumerGroups) / todouble(TotalConsumerGroups) * 100
+| order by timestamp desc
+
+// Query 10: Error Analysis and Troubleshooting
+traces
+| where timestamp > ago(2h)
+| where message contains "Consumer Group Lag Detailed"
+| extend logData = parse_json(substring(message, indexof(message, "{")))
+| mv-expand partition = logData.partitionDetails
+| project 
+    timestamp,
+    namespace = tostring(logData.namespace),
+    hubName = tostring(logData.hubName),
+    consumerGroup = tostring(logData.consumerGroup),
+    partitionId = tostring(partition.partition_id),
+    error = tostring(partition.error),
+    hasCheckpoint = tobool(partition.has_checkpoint),
+    isEmpty = tobool(partition.is_empty),
+    lagStatus = tostring(partition.lag_status)
+| where isnotempty(error) or hasCheckpoint == false or lagStatus in ("ERROR", "NO_CHECKPOINT", "HIGH_LAG")
+| extend 
+    issueType = case(
+        isnotempty(error), "Error",
+        hasCheckpoint == false, "Missing Checkpoint",
+        lagStatus == "HIGH_LAG", "High Lag",
+        "Other"
+    )
+| summarize 
+    IssueCount = count(),
+    UniquePartitions = dcount(partitionId),
+    UniqueConsumerGroups = dcount(consumerGroup),
+    SampleErrors = make_set(error, 3)
+    by namespace, hubName, issueType, bin(timestamp, 30m)
+| order by timestamp desc, IssueCount desc
