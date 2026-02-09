@@ -23,12 +23,167 @@ from utils.comprehensive_monitor import (
 )
 
 
+def get_namespace_configurations():
+    """
+    Get EventHub namespace configurations from environment variables.
+    
+    Supports two configuration patterns:
+    1. Multiple namespaces (recommended):
+       - EVENTHUB_NAMESPACES: comma-separated list of namespace names
+       - For each namespace 'name', expects:
+         - EVENTHUB_CONNECTION_STRING_<NAME>: connection string
+         - RESOURCE_GROUP_<NAME> (optional): resource group
+         - SUBSCRIPTION_ID_<NAME> (optional): subscription ID  
+         - STORAGE_CONNECTION_STRING_<NAME> (optional): storage connection
+    
+    2. Single namespace (backward compatibility):
+       - EventHubConnectionString: connection string
+       - ResourceGroup (optional): resource group
+       - SubscriptionId (optional): subscription ID
+       - StorageConnectionString (optional): storage connection
+    
+    Returns:
+        List of namespace configuration dictionaries
+    """
+    configs = []
+    
+    # Check for multiple namespaces configuration
+    namespaces_env = os.environ.get("EVENTHUB_NAMESPACES")
+    if namespaces_env:
+        namespace_names = [name.strip() for name in namespaces_env.split(",")]
+        
+        for namespace_name in namespace_names:
+            # Convert namespace name to uppercase for environment variable lookup
+            env_suffix = namespace_name.upper().replace("-", "_")
+            
+            connection_string = os.environ.get(f"EVENTHUB_CONNECTION_STRING_{env_suffix}")
+            if connection_string:
+                config = {
+                    'namespace': namespace_name,
+                    'connection_string': connection_string,
+                    'resource_group': os.environ.get(f"RESOURCE_GROUP_{env_suffix}"),
+                    'subscription_id': os.environ.get(f"SUBSCRIPTION_ID_{env_suffix}"),
+                    'storage_connection_string': os.environ.get(f"STORAGE_CONNECTION_STRING_{env_suffix}")
+                }
+                configs.append(config)
+            else:
+                logger = logging.getLogger("ComprehensiveEventHubMonitor")
+                logger.error(f"❌ Missing connection string for namespace '{namespace_name}'. "
+                           f"Expected environment variable: EVENTHUB_CONNECTION_STRING_{env_suffix}")
+    
+    # Fallback to single namespace configuration for backward compatibility
+    if not configs:
+        connection_string = os.environ.get("EventHubConnectionString")
+        if connection_string:
+            # Extract namespace from connection string for display
+            namespace_name = "default"
+            if "Endpoint=sb://" in connection_string:
+                try:
+                    namespace_name = connection_string.split("Endpoint=sb://")[1].split(".")[0]
+                except (IndexError, AttributeError):
+                    pass
+            
+            config = {
+                'namespace': namespace_name,
+                'connection_string': connection_string,
+                'resource_group': os.environ.get("ResourceGroup"),
+                'subscription_id': os.environ.get("SubscriptionId"),
+                'storage_connection_string': os.environ.get("StorageConnectionString")
+            }
+            configs.append(config)
+    
+    return configs
+
+
+def log_final_summary(logger: logging.Logger, namespace_results: list, total_processing_time: float,
+                     total_eventhubs: int, total_partitions: int, total_consumer_groups: int):
+    """Log final summary across all monitored namespaces"""
+    
+    logger.info(f"\n{'='*80}")
+    logger.info("🏁 FINAL MONITORING SUMMARY")
+    logger.info(f"{'='*80}")
+    
+    successful_namespaces = [r for r in namespace_results if r['status'] == 'success']
+    failed_namespaces = [r for r in namespace_results if r['status'] == 'error']
+    
+    logger.info(f"🎯 Total Namespaces Monitored: {len(namespace_results)}")
+    logger.info(f"✅ Successful: {len(successful_namespaces)}")
+    logger.info(f"❌ Failed: {len(failed_namespaces)}")
+    logger.info(f"⏱️  Total Processing Time: {total_processing_time:.2f} seconds")
+    
+    if successful_namespaces:
+        logger.info(f"📊 Aggregate Metrics:")
+        logger.info(f"   📡 Total EventHubs: {total_eventhubs}")
+        logger.info(f"   📦 Total Partitions: {total_partitions}")
+        logger.info(f"   👥 Total Consumer Groups: {total_consumer_groups}")
+        
+        # Calculate overall health across all namespaces
+        all_active_cgs = 0
+        all_total_cgs = 0
+        
+        for result in successful_namespaces:
+            metrics = result['metrics']
+            all_total_cgs += metrics.total_consumer_groups
+            all_active_cgs += sum(eh.active_consumer_groups for eh in metrics.eventhubs)
+        
+        if all_total_cgs > 0:
+            overall_activity = (all_active_cgs / all_total_cgs) * 100
+            health_status = get_health_status(overall_activity)
+            logger.info(f"🏥 Overall Health: {health_status}")
+            logger.info(f"   {all_active_cgs}/{all_total_cgs} consumer groups active across all namespaces")
+    
+    # Log individual namespace results
+    logger.info(f"\n📋 Per-Namespace Results:")
+    for result in namespace_results:
+        namespace = result['namespace']
+        processing_time = result['processing_time']
+        
+        if result['status'] == 'success':
+            metrics = result['metrics']
+            logger.info(f"   ✅ {namespace}: {metrics.total_eventhubs} EventHubs, "
+                       f"{metrics.total_consumer_groups} consumer groups "
+                       f"({processing_time:.2f}s)")
+        else:
+            logger.info(f"   ❌ {namespace}: FAILED - {result['error']} ({processing_time:.2f}s)")
+    
+    # Log structured summary for monitoring systems
+    summary_data = {
+        "eventType": "MultiNamespaceMonitoringSummary",
+        "timestamp": datetime.utcnow().isoformat(),
+        "totalProcessingTimeSeconds": total_processing_time,
+        "namespacesMonitored": len(namespace_results),
+        "namespacesSuccessful": len(successful_namespaces),
+        "namespacesFailed": len(failed_namespaces),
+        "aggregateMetrics": {
+            "totalEventHubs": total_eventhubs,
+            "totalPartitions": total_partitions,
+            "totalConsumerGroups": total_consumer_groups
+        },
+        "namespaceResults": [
+            {
+                "namespace": r['namespace'],
+                "status": r['status'],
+                "processingTime": r['processing_time'],
+                "eventhubs": r['metrics'].total_eventhubs if r['status'] == 'success' else 0,
+                "consumerGroups": r['metrics'].total_consumer_groups if r['status'] == 'success' else 0
+            } for r in namespace_results
+        ]
+    }
+    
+    import json
+    logger.info(f"Multi-Namespace Monitoring Summary: {json.dumps(summary_data)}")
+    
+    if failed_namespaces:
+        logger.warning(f"⚠️  {len(failed_namespaces)} namespace(s) failed monitoring - check logs for details")
+
+
 def main(timer: func.TimerRequest) -> None:
     """
     Timer-triggered function for comprehensive EventHub monitoring
     
     Runs every 5 minutes to monitor:
-    - All EventHubs in namespace
+    - All configured EventHub namespaces
+    - All EventHubs in each namespace
     - All partitions for each EventHub
     - All consumer groups for each EventHub  
     - Detailed lag metrics for each consumer group/partition
@@ -43,77 +198,112 @@ def main(timer: func.TimerRequest) -> None:
     logger.info("🚀 Starting comprehensive EventHub namespace monitoring...")
     start_time = time.time()
     
-    # Get configuration from environment
-    connection_string = os.environ.get("EventHubConnectionString")
-    resource_group = os.environ.get("ResourceGroup")
-    subscription_id = os.environ.get("SubscriptionId")
-    storage_connection_string = os.environ.get("StorageConnectionString")
+    # Get namespace configurations
+    namespace_configs = get_namespace_configurations()
     
-    # Validate required configuration
-    if not connection_string:
-        logger.error("❌ EventHubConnectionString environment variable is required")
+    if not namespace_configs:
+        logger.error("❌ No EventHub namespace configurations found. Please configure environment variables.")
         return
     
-    # Log configuration
-    logger.info("🔧 Configuration:")
-    logger.info(f"  Subscription ID: {subscription_id or 'Not provided'}")
-    logger.info(f"  Resource Group: {resource_group or 'Not provided'}")
-    logger.info(f"  Storage Connection: {'Configured' if storage_connection_string else 'Not configured'}")
+    logger.info(f"🔧 Found {len(namespace_configs)} namespace(s) to monitor:")
+    for config in namespace_configs:
+        logger.info(f"  📡 {config['namespace']} (Resource Group: {config['resource_group'] or 'Not provided'})")
     
-    if not storage_connection_string:
-        logger.warning("⚠️  Storage connection string not provided - checkpoint analysis will be limited")
+    total_processing_time = 0
+    total_eventhubs = 0
+    total_partitions = 0  
+    total_consumer_groups = 0
+    namespace_results = []
     
-    try:
-        # Initialize comprehensive monitor
-        monitor = ComprehensiveEventHubMonitor(
-            connection_string=connection_string,
-            subscription_id=subscription_id,
-            resource_group=resource_group,
-            storage_connection_string=storage_connection_string,
-            max_workers=8  # Parallel processing for better performance
-        )
+    # Monitor each namespace
+    for config in namespace_configs:
+        namespace_name = config['namespace']
+        logger.info(f"\n{'='*60}")
+        logger.info(f"🎯 Starting monitoring for namespace: {namespace_name}")
+        logger.info(f"{'='*60}")
         
-        # Initialize enhanced logger
-        monitor_logger = ComprehensiveMonitorLogger(logger)
+        namespace_start_time = time.time()
         
-        logger.info(f"📡 Monitoring namespace: {monitor.namespace}")
-        
-        # Perform comprehensive monitoring
-        namespace_metrics = monitor.monitor_namespace()
-        
-        processing_time = time.time() - start_time
-        
-        # Log comprehensive results using structured logging
-        log_monitoring_results(logger, monitor_logger, namespace_metrics, processing_time)
-        
-        # Clean up resources
-        monitor.close_all_clients()
-        
-        logger.info(f"✅ Comprehensive monitoring completed in {processing_time:.2f} seconds")
-        logger.info(f"📊 Summary: {namespace_metrics.total_eventhubs} EventHubs, "
-                   f"{namespace_metrics.total_partitions} partitions, "
-                   f"{namespace_metrics.total_consumer_groups} consumer groups")
-        
-    except Exception as e:
-        processing_time = time.time() - start_time
-        logger.error(f"❌ Error during comprehensive monitoring: {e}", exc_info=True)
-        
-        # Log error summary
-        error_summary = {
-            "eventType": "MonitoringError",
-            "timestamp": datetime.utcnow().isoformat(),
-            "processingTimeSeconds": processing_time,
-            "error": str(e),
-            "configuration": {
-                "hasConnectionString": bool(connection_string),
-                "hasSubscriptionId": bool(subscription_id),
-                "hasResourceGroup": bool(resource_group),
-                "hasStorageConnection": bool(storage_connection_string)
+        try:
+            # Initialize comprehensive monitor for this namespace
+            monitor = ComprehensiveEventHubMonitor(
+                connection_string=config['connection_string'],
+                subscription_id=config['subscription_id'],
+                resource_group=config['resource_group'],
+                storage_connection_string=config['storage_connection_string'],
+                max_workers=8  # Parallel processing for better performance
+            )
+            
+            # Initialize enhanced logger
+            monitor_logger = ComprehensiveMonitorLogger(logger)
+            
+            logger.info(f"📡 Monitoring namespace: {monitor.namespace}")
+            
+            # Perform comprehensive monitoring
+            namespace_metrics = monitor.monitor_namespace()
+            
+            namespace_processing_time = time.time() - namespace_start_time
+            total_processing_time += namespace_processing_time
+            
+            # Accumulate totals
+            total_eventhubs += namespace_metrics.total_eventhubs
+            total_partitions += namespace_metrics.total_partitions
+            total_consumer_groups += namespace_metrics.total_consumer_groups
+            
+            # Store results for final summary
+            namespace_results.append({
+                'namespace': namespace_name,
+                'metrics': namespace_metrics,
+                'processing_time': namespace_processing_time,
+                'status': 'success'
+            })
+            
+            # Log comprehensive results using structured logging
+            log_monitoring_results(logger, monitor_logger, namespace_metrics, namespace_processing_time)
+            
+            # Clean up resources
+            monitor.close_all_clients()
+            
+            logger.info(f"✅ Namespace '{namespace_name}' monitoring completed in {namespace_processing_time:.2f} seconds")
+            logger.info(f"📊 Namespace Summary: {namespace_metrics.total_eventhubs} EventHubs, "
+                       f"{namespace_metrics.total_partitions} partitions, "
+                       f"{namespace_metrics.total_consumer_groups} consumer groups")
+            
+        except Exception as e:
+            namespace_processing_time = time.time() - namespace_start_time
+            total_processing_time += namespace_processing_time
+            
+            logger.error(f"❌ Error monitoring namespace '{namespace_name}': {e}", exc_info=True)
+            
+            # Store error result
+            namespace_results.append({
+                'namespace': namespace_name,
+                'metrics': None,
+                'processing_time': namespace_processing_time,
+                'status': 'error',
+                'error': str(e)
+            })
+            
+            # Log error summary for this namespace
+            error_summary = {
+                "eventType": "NamespaceMonitoringError",
+                "timestamp": datetime.utcnow().isoformat(),
+                "namespace": namespace_name,
+                "processingTimeSeconds": namespace_processing_time,
+                "error": str(e),
+                "configuration": {
+                    "hasConnectionString": bool(config['connection_string']),
+                    "hasSubscriptionId": bool(config['subscription_id']),
+                    "hasResourceGroup": bool(config['resource_group']),
+                    "hasStorageConnection": bool(config['storage_connection_string'])
+                }
             }
-        }
-        
-        import json
-        logger.error(f"Monitoring Error Summary: {json.dumps(error_summary)}")
+            
+            import json
+            logger.error(f"Namespace Monitoring Error Summary: {json.dumps(error_summary)}")
+    
+    # Log final summary across all namespaces
+    log_final_summary(logger, namespace_results, total_processing_time, total_eventhubs, total_partitions, total_consumer_groups)
 
 
 def log_monitoring_results(logger: logging.Logger, 
@@ -140,7 +330,7 @@ def log_monitoring_results(logger: logging.Logger,
         logger.info(f"\n🎯 EventHub: {eh_metrics.hub_name}")
         logger.info(f"  Partitions: {eh_metrics.partition_count}")
         logger.info(f"  Consumer Groups: {eh_metrics.total_consumer_groups}")
-        logger.info(f"  Healthy Consumer Groups: {eh_metrics.healthy_consumer_groups}")
+        logger.info(f"  Active Consumer Groups: {eh_metrics.active_consumer_groups}")
         logger.info(f"  Status: {eh_metrics.status}")
         
         # Log structured EventHub metrics
@@ -148,29 +338,29 @@ def log_monitoring_results(logger: logging.Logger,
         
         # 3. Log consumer group health summary
         for cg_metrics in eh_metrics.consumer_groups:
-            health_status = get_health_status(cg_metrics.health_score)
+            health_status = get_health_status(cg_metrics.activity_score)
             logger.info(f"    👥 Consumer Group '{cg_metrics.consumer_group}': {health_status}")
-            logger.info(f"       Health Score: {cg_metrics.health_score:.1f}%")
-            logger.info(f"       Max Lag: {cg_metrics.max_sequence_lag} messages")
-            logger.info(f"       Healthy Partitions: {cg_metrics.healthy_partitions}/{cg_metrics.total_partitions}")
+            logger.info(f"       Activity Score: {cg_metrics.activity_score:.1f}%")
+            logger.info(f"       Total Messages Available: {cg_metrics.total_available_messages}")
+            logger.info(f"       Active Partitions: {cg_metrics.active_partitions}/{cg_metrics.total_partitions}")
             
             if cg_metrics.partitions_with_errors > 0:
                 logger.warning(f"       ⚠️  {cg_metrics.partitions_with_errors} partitions have errors")
-            if cg_metrics.partitions_without_checkpoints > 0:
-                logger.warning(f"       ⚠️  {cg_metrics.partitions_without_checkpoints} partitions without checkpoints")
+            if cg_metrics.empty_partitions > 0:
+                logger.warning(f"       ⚠️  {cg_metrics.empty_partitions} partitions are empty")
             
             # Log detailed consumer group metrics
-            monitor_logger.log_consumer_group_lag(cg_metrics)
+            monitor_logger.log_consumer_group_activity(cg_metrics)
     
     # 4. Log overall health summary
     total_cgs = namespace_metrics.total_consumer_groups
-    healthy_cgs = sum(eh.healthy_consumer_groups for eh in namespace_metrics.eventhubs)
+    active_cgs = sum(eh.active_consumer_groups for eh in namespace_metrics.eventhubs)
     
     if total_cgs > 0:
-        overall_health = (healthy_cgs / total_cgs) * 100
-        health_status = get_health_status(overall_health)
+        overall_activity = (active_cgs / total_cgs) * 100
+        health_status = get_health_status(overall_activity)
         logger.info(f"\n🏥 OVERALL HEALTH: {health_status}")
-        logger.info(f"   {healthy_cgs}/{total_cgs} consumer groups healthy ({overall_health:.1f}%)")
+        logger.info(f"   {active_cgs}/{total_cgs} consumer groups active ({overall_activity:.1f}%)")
     
     # 5. Log monitoring summary
     monitor_logger.log_monitoring_summary(processing_time, namespace_metrics)
@@ -195,15 +385,15 @@ def log_health_alerts(logger: logging.Logger, namespace_metrics):
     
     for eh_metrics in namespace_metrics.eventhubs:
         for cg_metrics in eh_metrics.consumer_groups:
-            if cg_metrics.health_score < 70:  # Critical threshold
+            if cg_metrics.activity_score < 70:  # Critical threshold
                 alerts.append({
-                    "severity": "CRITICAL" if cg_metrics.health_score < 50 else "WARNING",
+                    "severity": "CRITICAL" if cg_metrics.activity_score < 50 else "WARNING",
                     "eventhub": eh_metrics.hub_name,
                     "consumerGroup": cg_metrics.consumer_group,
-                    "healthScore": cg_metrics.health_score,
-                    "maxLag": cg_metrics.max_sequence_lag,
+                    "activityScore": cg_metrics.activity_score,
+                    "totalAvailableMessages": cg_metrics.total_available_messages,
                     "partitionsWithErrors": cg_metrics.partitions_with_errors,
-                    "partitionsWithoutCheckpoints": cg_metrics.partitions_without_checkpoints
+                    "emptyPartitions": cg_metrics.empty_partitions
                 })
     
     if alerts:
@@ -214,8 +404,8 @@ def log_health_alerts(logger: logging.Logger, namespace_metrics):
             logger.warning(f"{severity_emoji} {alert['severity']}: "
                          f"EventHub '{alert['eventhub']}', "
                          f"Consumer Group '{alert['consumerGroup']}' - "
-                         f"Health: {alert['healthScore']:.1f}%, "
-                         f"Max Lag: {alert['maxLag']}")
+                         f"Activity: {alert['activityScore']:.1f}%, "
+                         f"Available Messages: {alert['totalAvailableMessages']}")
         
         # Log structured alert data
         import json
